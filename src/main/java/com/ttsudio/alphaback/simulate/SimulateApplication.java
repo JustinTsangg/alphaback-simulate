@@ -4,7 +4,6 @@ import java.io.File;
 import java.net.URL;
 import java.net.URLClassLoader;
 
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -29,178 +28,271 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 @SpringBootApplication
 @RestController
 public class SimulateApplication {
     static final String GATHER_DATA_FUNCTION_NAME = "gatherData";
+    static final String GET_MODEL_FUNCTION_NAME = "modelRegistryService";
 
     Logger logger = LoggerFactory.getLogger(getClass());
     LambdaClient lambdaClient = LambdaClient.create();
-    public static void main(String[] args) {
-      SpringApplication.run(SimulateApplication.class, args);
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    private static class TimeSeriesData {
+        public final JsonNode tsNode;
+        public final String symbol;
+
+        public TimeSeriesData(JsonNode tsNode, String symbol) {
+            this.tsNode = tsNode;
+            this.symbol = symbol;
+        }
     }
 
-    @PostMapping(path ="/simulate", produces = MediaType.APPLICATION_JSON_VALUE)
-    public SimulationResponse simulate(
-        // @RequestParam(value="stocks") List<String> stocks,
-        // @RequestParam(value="modelId") String modelId,
-        // @RequestParam(value="startDate") String startDate,
-        // @RequestParam(value="endDate") String endDate,
-        @RequestParam(value="timeStep", defaultValue="TIME_SERIES_DAILY") String timeStep) {
-            File modelDir = new File("models");
-            try (URLClassLoader loader = new URLClassLoader(new URL[]{modelDir.toURI().toURL()})) {
-              Class<?> clazz = loader.loadClass("com.ttsudio.alphaback.ExampleModel");
-              logger.info(clazz.getSimpleName());
-              if(!Model.class.isAssignableFrom(clazz)) {
-                throw new RuntimeException("invalid class");
-              }
+    public static void main(String[] args) {
+        SpringApplication.run(SimulateApplication.class, args);
+    }
 
-              Model model = (Model) clazz.getDeclaredConstructor().newInstance();
+    private JsonNode fetchModelBody(String modelId) {
+        try {
+            InvokeResponse getModelResponse = lambdaClient.invoke(
+                    InvokeRequest.builder()
+                            .functionName(GET_MODEL_FUNCTION_NAME)
+                            .payload(SdkBytes.fromUtf8String(
+                                    String.format("""
+                                            {
+                                              "rawPath": "/models/%s",
+                                              "queryStringParameters": {
+                                                "parameter1": "value1,value2",
+                                                "parameter2": "value"
+                                              },
+                                              "requestContext": {
+                                                "http": {
+                                                  "method": "GET",
+                                                  "path": "/models/%s",
+                                                  "protocol": "HTTP/1.1",
+                                                  "sourceIp": "192.168.0.1/32",
+                                                  "userAgent": "agent"
+                                                }
+                                              },
+                                              "body": "eyJ0ZXN0IjoiYm9keSJ9",
+                                              "pathParameters": {
+                                                "parameter1": "value1"
+                                              }
+                                            }
+                                            """, modelId, modelId)))
+                            .build());
+            String getModelPayload = getModelResponse.payload().asUtf8String();
+            logger.info("Get model response: " + getModelPayload);
 
-              InvokeResponse res = lambdaClient.invoke(
-                InvokeRequest.builder()
-                  .functionName(GATHER_DATA_FUNCTION_NAME)
-                  .payload(SdkBytes.fromUtf8String("{"
-                    +"\"function\": \"" + timeStep + "\","
-                    +"\"symbol\": \"AAPL\""
-                  +"}"))
-                  .build()
-              );
-              String payload = res.payload().asUtf8String();
-              logger.info("Lambda response: " + payload);
+            JsonNode getModelRoot = mapper.readTree(getModelPayload);
+            String bodyStr = getModelRoot.has("body") ? getModelRoot.get("body").asText() : getModelRoot.toString();
+            JsonNode bodyJson = mapper.readTree(bodyStr);
+            return bodyJson;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
 
-              ObjectMapper mapper = new ObjectMapper();
-              JsonNode root = mapper.readTree(payload);
+    private TimeSeriesData fetchTimeSeries(String timeStep) {
+        try {
+            InvokeResponse res = lambdaClient.invoke(
+                    InvokeRequest.builder()
+                            .functionName(GATHER_DATA_FUNCTION_NAME)
+                                .payload(SdkBytes.fromUtf8String("{\"function\":\"" + timeStep + "\",\"symbol\":\"AAPL\"}"))
+                            .build());
+            String payload = res.payload().asUtf8String();
+            logger.info("Lambda response: " + payload);
 
-              // navigate to time series node (supports payload wrapped under "data")
-              JsonNode dataNode = root.has("data") ? root.get("data") : root;
-              String timeSeriesKey = null;
-              // collect field names into a list (Iterator -> List)
-              List<String> dataKeys = new ArrayList<>();
-              dataNode.fieldNames().forEachRemaining(dataKeys::add);
-              for (String key : dataKeys) {
+            JsonNode root = mapper.readTree(payload);
+            JsonNode dataNode = root.has("data") ? root.get("data") : root;
+
+            List<String> dataKeys = new ArrayList<>();
+            dataNode.fieldNames().forEachRemaining(dataKeys::add);
+            String timeSeriesKey = null;
+            for (String key : dataKeys) {
                 if (key.toLowerCase().contains("time series")) {
-                  timeSeriesKey = key;
-                  break;
+                    timeSeriesKey = key;
+                    break;
                 }
-              }
-              JsonNode tsNode = timeSeriesKey != null ? dataNode.get(timeSeriesKey) : dataNode.get("Time Series (Daily)");
+            }
+            JsonNode tsNode = timeSeriesKey != null ? dataNode.get(timeSeriesKey) : dataNode.get("Time Series (Daily)");
 
-              // symbol from meta if available
-              String symbol = "UNKNOWN";
-              if (dataNode.has("Meta Data") && dataNode.get("Meta Data").has("2. Symbol")) {
+            String symbol = "UNKNOWN";
+            if (dataNode.has("Meta Data") && dataNode.get("Meta Data").has("2. Symbol")) {
                 symbol = dataNode.get("Meta Data").get("2. Symbol").asText();
-              }
+            }
 
-              SimulationResponse simResp = new SimulationResponse();
-              double startingCapital = 100000.0;
-              double cash = startingCapital;
-              Map<String, Float> owned = new HashMap<>();
+            return new TimeSeriesData(tsNode, symbol);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
 
-              if (tsNode != null && tsNode.isObject()) {
+    @PostMapping(path = "/simulate", produces = MediaType.APPLICATION_JSON_VALUE)
+    public SimulationResponse simulate(
+            // @RequestParam(value="stocks") List<String> stocks,
+            @RequestParam(value = "modelId", defaultValue = "726034f9-44c7-49df-9fac-1241da8ef221") String modelId,
+            // @RequestParam(value="startDate") String startDate,
+            // @RequestParam(value="endDate") String endDate,
+            @RequestParam(value = "timeStep", defaultValue = "TIME_SERIES_DAILY") String timeStep) {
+                JsonNode bodyJson = fetchModelBody(modelId);
+                String downloadUrl = bodyJson.has("downloadUrl") ? bodyJson.get("downloadUrl").asText() : null;
+                String classPathRaw = bodyJson.has("classPath") ? bodyJson.get("classPath").asText() : "com/ttsudio/alphaback/ExampleModel";
+                logger.info("Model downloadUrl: " + downloadUrl + " classPath: " + classPathRaw);
+
+        File modelDir = new File("models");
+            // download class file if a presigned url is present
+            if (downloadUrl != null && !downloadUrl.isEmpty()) {
+                // normalize class path to use slashes and append .class
+                String classPathSlashes = classPathRaw.replace('.', '/');
+                classPathSlashes = classPathSlashes.replace('\\', '/');
+                if (!classPathSlashes.endsWith(".class")) classPathSlashes = classPathSlashes + ".class";
+
+                File targetFile = new File(modelDir, classPathSlashes);
+                try {
+                    Files.createDirectories(targetFile.getParentFile().toPath());
+                    try (InputStream in = new java.net.URL(downloadUrl).openStream()) {
+                        Files.copy(in, targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                    logger.info("Downloaded model class to: " + targetFile.getAbsolutePath());
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to download model class", e);
+                }
+            }
+
+            try (URLClassLoader loader = new URLClassLoader(new URL[] { modelDir.toURI().toURL() })) {
+                String className = classPathRaw.replace('/', '.').replace('\\', '.');
+                Class<?> clazz = loader.loadClass(className);
+            logger.info(clazz.getSimpleName());
+            if (!Model.class.isAssignableFrom(clazz)) {
+                throw new RuntimeException("invalid class");
+            }
+
+            Model model = (Model) clazz.getDeclaredConstructor().newInstance();
+
+            TimeSeriesData tsData = fetchTimeSeries(timeStep);
+            JsonNode tsNode = tsData.tsNode;
+            String symbol = tsData.symbol;
+
+            SimulationResponse simResp = new SimulationResponse();
+            double startingCapital = 100000.0;
+            double cash = startingCapital;
+            Map<String, Float> owned = new HashMap<>();
+
+            if (tsNode != null && tsNode.isObject()) {
                 List<String> dates = new ArrayList<>();
                 tsNode.fieldNames().forEachRemaining(dates::add);
                 // sort from oldest -> newest
                 Collections.sort(dates);
 
                 for (String date : dates) {
-                  JsonNode dayNode = tsNode.get(date);
-                  if (dayNode == null) continue;
+                    JsonNode dayNode = tsNode.get(date);
+                    if (dayNode == null)
+                        continue;
 
-                  // try to get close price
-                  String closeStr = null;
-                  if (dayNode.has("4. close")) closeStr = dayNode.get("4. close").asText();
-                  else if (dayNode.has("close")) closeStr = dayNode.get("close").asText();
-                  if (closeStr == null) continue;
+                    // try to get close price
+                    String closeStr = null;
+                    if (dayNode.has("4. close"))
+                        closeStr = dayNode.get("4. close").asText();
+                    else if (dayNode.has("close"))
+                        closeStr = dayNode.get("close").asText();
+                    if (closeStr == null)
+                        continue;
 
-                  float price = Float.parseFloat(closeStr);
+                    float price = Float.parseFloat(closeStr);
 
-                  Map<String, Float> pricesMap = new HashMap<>();
-                  pricesMap.put(symbol, price);
+                    Map<String, Float> pricesMap = new HashMap<>();
+                    pricesMap.put(symbol, price);
 
-                  // create State (prices, owned)
-                  State state = new State(pricesMap, new HashMap<>(owned));
+                    // create State (prices, owned)
+                    State state = new State(pricesMap, new HashMap<>(owned));
 
-                  // call model (returns list of Orders loaded by child loader)
-                  List<?> decisions = model.simulateStep(state);
-                  if (decisions != null) {
-                    for (Object ord : decisions) {
-                      try {
-                        Method mStock = ord.getClass().getMethod("stock");
-                        Method mAmount = ord.getClass().getMethod("amount");
-                        Method mIsBuy = ord.getClass().getMethod("isBuy");
+                    // call model (returns list of Orders loaded by child loader)
+                    List<?> decisions = model.simulateStep(state);
+                    if (decisions != null) {
+                        for (Object ord : decisions) {
+                            try {
+                                Method mStock = ord.getClass().getMethod("stock");
+                                Method mAmount = ord.getClass().getMethod("amount");
+                                Method mIsBuy = ord.getClass().getMethod("isBuy");
 
-                        String stock = (String) mStock.invoke(ord);
-                        Float amount = (Float) mAmount.invoke(ord);
-                        Boolean isBuy = (Boolean) mIsBuy.invoke(ord);
+                                String stock = (String) mStock.invoke(ord);
+                                Float amount = (Float) mAmount.invoke(ord);
+                                Boolean isBuy = (Boolean) mIsBuy.invoke(ord);
 
-                        // apply order
-                        if (Boolean.TRUE.equals(isBuy)) {
-                          double cost = amount * price;
-                          if (cash >= cost) {
-                            cash -= cost;
-                            owned.put(stock, owned.getOrDefault(stock, 0f) + amount);
-                          } else {
-                            // not enough cash -> skip
-                          }
-                        } else {
-                          float have = owned.getOrDefault(stock, 0f);
-                          float toSell = Math.min(have, amount);
-                          cash += toSell * price;
-                          if (toSell >= have) owned.remove(stock);
-                          else owned.put(stock, have - toSell);
+                                // apply order
+                                if (Boolean.TRUE.equals(isBuy)) {
+                                    double cost = amount * price;
+                                    if (cash >= cost) {
+                                        cash -= cost;
+                                        owned.put(stock, owned.getOrDefault(stock, 0f) + amount);
+                                    } else {
+                                        // not enough cash -> skip
+                                    }
+                                } else {
+                                    float have = owned.getOrDefault(stock, 0f);
+                                    float toSell = Math.min(have, amount);
+                                    cash += toSell * price;
+                                    if (toSell >= have)
+                                        owned.remove(stock);
+                                    else
+                                        owned.put(stock, have - toSell);
+                                }
+
+                                simResp.getDecisions().add(new SimulationResponse.Decision(date, stock, amount, isBuy));
+                            } catch (NoSuchMethodException nsme) {
+                                logger.warn("Unexpected order shape", nsme);
+                            }
                         }
-
-                        simResp.getDecisions().add(new SimulationResponse.Decision(date, stock, amount, isBuy));
-                      } catch (NoSuchMethodException nsme) {
-                        logger.warn("Unexpected order shape", nsme);
-                      }
                     }
-                  }
                 }
-              }
+            }
 
-              // compute ending capital using last known price
-              double holdingsValue = 0.0;
-              // if we have any owned assets, try last price from tsNode
-              float lastPrice = 0f;
-              if (tsNode != null) {
+            // compute ending capital using last known price
+            double holdingsValue = 0.0;
+            // if we have any owned assets, try last price from tsNode
+            float lastPrice = 0f;
+            if (tsNode != null) {
                 List<String> datesAll = new ArrayList<>();
                 tsNode.fieldNames().forEachRemaining(datesAll::add);
                 Collections.sort(datesAll);
                 if (!datesAll.isEmpty()) {
-                  JsonNode lastDay = tsNode.get(datesAll.get(datesAll.size() - 1));
-                  if (lastDay != null) {
-                    String close = lastDay.has("4. close") ? lastDay.get("4. close").asText() : (lastDay.has("close") ? lastDay.get("close").asText() : null);
-                    if (close != null) lastPrice = Float.parseFloat(close);
-                  }
+                    JsonNode lastDay = tsNode.get(datesAll.get(datesAll.size() - 1));
+                    if (lastDay != null) {
+                        String close = lastDay.has("4. close") ? lastDay.get("4. close").asText()
+                                : (lastDay.has("close") ? lastDay.get("close").asText() : null);
+                        if (close != null)
+                            lastPrice = Float.parseFloat(close);
+                    }
                 }
-              }
-              for (Map.Entry<String, Float> e : owned.entrySet()) {
+            }
+            for (Map.Entry<String, Float> e : owned.entrySet()) {
                 // assume lastPrice applies for the symbol
                 holdingsValue += e.getValue() * lastPrice;
-              }
-
-              double endingCapital = cash + holdingsValue;
-              double gainPct = (endingCapital - startingCapital) / startingCapital * 100.0;
-
-              simResp.setStatus("OK");
-              simResp.setStartingCapital(startingCapital);
-              simResp.setEndingCapital(endingCapital);
-              simResp.setGainPercentage(gainPct);
-
-              logger.info("Simulation finished: gain%=" + gainPct);
-              return simResp;
-            } catch (Exception e) {
-              throw new RuntimeException(e);
             }
-          
+
+            double endingCapital = cash + holdingsValue;
+            double gainPct = (endingCapital - startingCapital) / startingCapital * 100.0;
+
+            simResp.setStatus("OK");
+            simResp.setStartingCapital(startingCapital);
+            simResp.setEndingCapital(endingCapital);
+            simResp.setGainPercentage(gainPct);
+
+            logger.info("Simulation finished: gain%=" + gainPct);
+            return simResp;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
     }
 
     @GetMapping("/hello")
     public String hello(@RequestParam(value = "name", defaultValue = "World") String name) {
-      return String.format("Hello %s!", name);
+        return String.format("Hello %s!", name);
     }
 }
