@@ -36,6 +36,6 @@ dependencies {
 	implementation 'com.ttsudio.alphaback:alphaback-model:0.1.1'
 }
 
-// tasks.named('test') {
-// 	useJUnitPlatform()
-// }
+tasks.named('test') {
+	useJUnitPlatform()
+}
