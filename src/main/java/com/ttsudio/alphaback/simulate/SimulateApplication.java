@@ -26,8 +26,10 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -43,12 +45,10 @@ public class SimulateApplication {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static class TimeSeriesData {
-        public final JsonNode tsNode;
-        public final String symbol;
+        public final Map<String, JsonNode> tsMap;
 
-        public TimeSeriesData(JsonNode tsNode, String symbol) {
-            this.tsNode = tsNode;
-            this.symbol = symbol;
+        public TimeSeriesData(Map<String, JsonNode> tsMap) {
+            this.tsMap = tsMap;
         }
     }
 
@@ -97,12 +97,22 @@ public class SimulateApplication {
         }
     }
 
-    private TimeSeriesData fetchTimeSeries(String timeStep) {
+    private TimeSeriesData fetchTimeSeries(String timeStep, List<String> requestedStocks) {
         try {
+            // build payload using requestedStocks if provided (comma-separated string)
+            com.fasterxml.jackson.databind.node.ObjectNode payloadNode = mapper.createObjectNode();
+            payloadNode.put("function", timeStep);
+            if (requestedStocks != null && !requestedStocks.isEmpty()) {
+                String csv = requestedStocks.stream().map(String::trim).collect(java.util.stream.Collectors.joining(","));
+                // keep field name `symbol` for backward compatibility; value is comma-separated list
+                payloadNode.put("symbol", csv);
+            }
+            String payloadStr = mapper.writeValueAsString(payloadNode);
+
             InvokeResponse res = lambdaClient.invoke(
                     InvokeRequest.builder()
                             .functionName(GATHER_DATA_FUNCTION_NAME)
-                                .payload(SdkBytes.fromUtf8String("{\"function\":\"" + timeStep + "\",\"symbol\":\"AAPL\"}"))
+                            .payload(SdkBytes.fromUtf8String(payloadStr))
                             .build());
             String payload = res.payload().asUtf8String();
             logger.info("Lambda response: " + payload);
@@ -110,23 +120,31 @@ public class SimulateApplication {
             JsonNode root = mapper.readTree(payload);
             JsonNode dataNode = root.has("data") ? root.get("data") : root;
 
-            List<String> dataKeys = new ArrayList<>();
-            dataNode.fieldNames().forEachRemaining(dataKeys::add);
-            String timeSeriesKey = null;
-            for (String key : dataKeys) {
-                if (key.toLowerCase().contains("time series")) {
-                    timeSeriesKey = key;
-                    break;
+            Map<String, JsonNode> tsMap = new HashMap<>();
+
+            // If requestedStocks provided, try to load those; otherwise use all keys in dataNode
+            List<String> keys = new ArrayList<>();
+            if (requestedStocks != null && !requestedStocks.isEmpty()) {
+                for (String s : requestedStocks) keys.add(s.trim());
+            } else {
+                dataNode.fieldNames().forEachRemaining(keys::add);
+            }
+
+            for (String key : keys) {
+                if (!dataNode.has(key)) continue;
+                JsonNode stockNode = dataNode.get(key);
+                // find the time series field inside this stock node
+                List<String> stockFields = new ArrayList<>();
+                stockNode.fieldNames().forEachRemaining(stockFields::add);
+                String tsKey = null;
+                for (String f : stockFields) {
+                    if (f.toLowerCase().contains("time series")) { tsKey = f; break; }
                 }
-            }
-            JsonNode tsNode = timeSeriesKey != null ? dataNode.get(timeSeriesKey) : dataNode.get("Time Series (Daily)");
-
-            String symbol = "UNKNOWN";
-            if (dataNode.has("Meta Data") && dataNode.get("Meta Data").has("2. Symbol")) {
-                symbol = dataNode.get("Meta Data").get("2. Symbol").asText();
+                JsonNode ts = tsKey != null ? stockNode.get(tsKey) : stockNode.get("Time Series (Daily)");
+                if (ts != null && ts.isObject()) tsMap.put(key, ts);
             }
 
-            return new TimeSeriesData(tsNode, symbol);
+            return new TimeSeriesData(tsMap);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -134,10 +152,8 @@ public class SimulateApplication {
 
     @PostMapping(path = "/simulate", produces = MediaType.APPLICATION_JSON_VALUE)
     public SimulationResponse simulate(
-            // @RequestParam(value="stocks") List<String> stocks,
+            @RequestParam(value="stocks", defaultValue = "GOOGL, AAPL, NVDA") List<String> stocks,
             @RequestParam(value = "modelId", defaultValue = "726034f9-44c7-49df-9fac-1241da8ef221") String modelId,
-            // @RequestParam(value="startDate") String startDate,
-            // @RequestParam(value="endDate") String endDate,
             @RequestParam(value = "timeStep", defaultValue = "TIME_SERIES_DAILY") String timeStep) {
                 JsonNode bodyJson = fetchModelBody(modelId);
                 String downloadUrl = bodyJson.has("downloadUrl") ? bodyJson.get("downloadUrl").asText() : null;
@@ -174,105 +190,104 @@ public class SimulateApplication {
 
             Model model = (Model) clazz.getDeclaredConstructor().newInstance();
 
-            TimeSeriesData tsData = fetchTimeSeries(timeStep);
-            JsonNode tsNode = tsData.tsNode;
-            String symbol = tsData.symbol;
+            TimeSeriesData tsData = fetchTimeSeries(timeStep, stocks);
+            Map<String, JsonNode> tsMap = tsData.tsMap;
 
             SimulationResponse simResp = new SimulationResponse();
             double startingCapital = 100000.0;
             double cash = startingCapital;
             Map<String, Float> owned = new HashMap<>();
 
-            if (tsNode != null && tsNode.isObject()) {
-                List<String> dates = new ArrayList<>();
-                tsNode.fieldNames().forEachRemaining(dates::add);
-                // sort from oldest -> newest
-                Collections.sort(dates);
+            // collect union of all dates from all time series
+            Set<String> dateSet = new HashSet<>();
+            for (JsonNode stockTs : tsMap.values()) {
+                stockTs.fieldNames().forEachRemaining(dateSet::add);
+            }
+            List<String> dates = new ArrayList<>(dateSet);
+            Collections.sort(dates);
 
-                for (String date : dates) {
-                    JsonNode dayNode = tsNode.get(date);
-                    if (dayNode == null)
-                        continue;
+            // prepare last price map for final valuation
+            Map<String, Float> lastPriceMap = new HashMap<>();
+            for (Map.Entry<String, JsonNode> e : tsMap.entrySet()) {
+                List<String> sd = new ArrayList<>();
+                e.getValue().fieldNames().forEachRemaining(sd::add);
+                Collections.sort(sd);
+                if (!sd.isEmpty()) {
+                    JsonNode lastDay = e.getValue().get(sd.get(sd.size() - 1));
+                    if (lastDay != null) {
+                        String close = lastDay.has("4. close") ? lastDay.get("4. close").asText() : (lastDay.has("close") ? lastDay.get("close").asText() : null);
+                        if (close != null) lastPriceMap.put(e.getKey(), Float.parseFloat(close));
+                    }
+                }
+            }
 
-                    // try to get close price
-                    String closeStr = null;
-                    if (dayNode.has("4. close"))
-                        closeStr = dayNode.get("4. close").asText();
-                    else if (dayNode.has("close"))
-                        closeStr = dayNode.get("close").asText();
-                    if (closeStr == null)
-                        continue;
+            for (String date : dates) {
+                // build prices map for this date
+                Map<String, Float> pricesMap = new HashMap<>();
+                for (Map.Entry<String, JsonNode> e : tsMap.entrySet()) {
+                    String stock = e.getKey();
+                    JsonNode stockTs = e.getValue();
+                    if (stockTs.has(date)) {
+                        JsonNode dayNode = stockTs.get(date);
+                        String closeStr = null;
+                        if (dayNode.has("4. close")) closeStr = dayNode.get("4. close").asText();
+                        else if (dayNode.has("close")) closeStr = dayNode.get("close").asText();
+                        if (closeStr != null) {
+                            try { pricesMap.put(stock, Float.parseFloat(closeStr)); } catch (NumberFormatException ignore) {}
+                        }
+                    }
+                }
 
-                    float price = Float.parseFloat(closeStr);
+                if (pricesMap.isEmpty()) continue;
 
-                    Map<String, Float> pricesMap = new HashMap<>();
-                    pricesMap.put(symbol, price);
+                // create State (prices, owned)
+                State state = new State(pricesMap, new HashMap<>(owned));
 
-                    // create State (prices, owned)
-                    State state = new State(pricesMap, new HashMap<>(owned));
+                // call model
+                List<?> decisions = model.simulateStep(state);
+                if (decisions != null) {
+                    for (Object ord : decisions) {
+                        try {
+                            Method mStock = ord.getClass().getMethod("stock");
+                            Method mAmount = ord.getClass().getMethod("amount");
+                            Method mIsBuy = ord.getClass().getMethod("isBuy");
 
-                    // call model (returns list of Orders loaded by child loader)
-                    List<?> decisions = model.simulateStep(state);
-                    if (decisions != null) {
-                        for (Object ord : decisions) {
-                            try {
-                                Method mStock = ord.getClass().getMethod("stock");
-                                Method mAmount = ord.getClass().getMethod("amount");
-                                Method mIsBuy = ord.getClass().getMethod("isBuy");
+                            String stock = (String) mStock.invoke(ord);
+                            Float amount = (Float) mAmount.invoke(ord);
+                            Boolean isBuy = (Boolean) mIsBuy.invoke(ord);
 
-                                String stock = (String) mStock.invoke(ord);
-                                Float amount = (Float) mAmount.invoke(ord);
-                                Boolean isBuy = (Boolean) mIsBuy.invoke(ord);
+                            float price = pricesMap.getOrDefault(stock, lastPriceMap.getOrDefault(stock, 0f));
 
-                                // apply order
-                                if (Boolean.TRUE.equals(isBuy)) {
-                                    double cost = amount * price;
-                                    if (cash >= cost) {
-                                        cash -= cost;
-                                        owned.put(stock, owned.getOrDefault(stock, 0f) + amount);
-                                    } else {
-                                        // not enough cash -> skip
-                                    }
-                                } else {
-                                    float have = owned.getOrDefault(stock, 0f);
-                                    float toSell = Math.min(have, amount);
-                                    cash += toSell * price;
-                                    if (toSell >= have)
-                                        owned.remove(stock);
-                                    else
-                                        owned.put(stock, have - toSell);
+                            // apply order
+                            if (Boolean.TRUE.equals(isBuy)) {
+                                double cost = amount * price;
+                                if (cash >= cost) {
+                                    cash -= cost;
+                                    owned.put(stock, owned.getOrDefault(stock, 0f) + amount);
                                 }
-
-                                simResp.getDecisions().add(new SimulationResponse.Decision(date, stock, amount, isBuy));
-                            } catch (NoSuchMethodException nsme) {
-                                logger.warn("Unexpected order shape", nsme);
+                            } else {
+                                float have = owned.getOrDefault(stock, 0f);
+                                float toSell = Math.min(have, amount);
+                                cash += toSell * price;
+                                if (toSell >= have) owned.remove(stock);
+                                else owned.put(stock, have - toSell);
                             }
+
+                            simResp.getDecisions().add(new SimulationResponse.Decision(date, stock, amount, isBuy));
+                        } catch (NoSuchMethodException nsme) {
+                            logger.warn("Unexpected order shape", nsme);
+                        } catch (Exception ex) {
+                            throw new RuntimeException(ex);
                         }
                     }
                 }
             }
 
-            // compute ending capital using last known price
+            // compute ending capital using last known prices per stock
             double holdingsValue = 0.0;
-            // if we have any owned assets, try last price from tsNode
-            float lastPrice = 0f;
-            if (tsNode != null) {
-                List<String> datesAll = new ArrayList<>();
-                tsNode.fieldNames().forEachRemaining(datesAll::add);
-                Collections.sort(datesAll);
-                if (!datesAll.isEmpty()) {
-                    JsonNode lastDay = tsNode.get(datesAll.get(datesAll.size() - 1));
-                    if (lastDay != null) {
-                        String close = lastDay.has("4. close") ? lastDay.get("4. close").asText()
-                                : (lastDay.has("close") ? lastDay.get("close").asText() : null);
-                        if (close != null)
-                            lastPrice = Float.parseFloat(close);
-                    }
-                }
-            }
             for (Map.Entry<String, Float> e : owned.entrySet()) {
-                // assume lastPrice applies for the symbol
-                holdingsValue += e.getValue() * lastPrice;
+                float lp = lastPriceMap.getOrDefault(e.getKey(), 0f);
+                holdingsValue += e.getValue() * lp;
             }
 
             double endingCapital = cash + holdingsValue;
