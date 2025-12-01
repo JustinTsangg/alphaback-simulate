@@ -1,0 +1,10 @@
+{
+  "message": "Available service retrieved successfully.",
+  "timestamp": "2025-12-01 22:55:45.062580",
+  "service": {
+    "service_name": "Gather Data Service",
+    "service_id": 0,
+    "Available": true,
+    "service_arn": "arn:aws:lambda:us-east-2:403732030809:function:gatherData"
+  }
+}

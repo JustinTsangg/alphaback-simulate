@@ -38,6 +38,9 @@ public class SimulateApplicationUnitTest {
             .payload(SdkBytes.fromUtf8String(getModelPayload)).build();
         InvokeResponse gatherResp = InvokeResponse.builder()
                 .payload(SdkBytes.fromUtf8String(gatherJson)).build();
+        // mock serviceConsumer response to point to the gatherData function (ARN may include :function:prefix)
+        String serviceJson = readResource("/serviceConsumerResponse.json");
+        InvokeResponse serviceResp = InvokeResponse.builder().payload(SdkBytes.fromUtf8String(serviceJson)).build();
 
         // configure mock for function name
         org.mockito.Mockito.when(mockLambda.invoke(org.mockito.ArgumentMatchers.argThat(new ArgumentMatcher<InvokeRequest>() {
@@ -52,9 +55,21 @@ public class SimulateApplicationUnitTest {
             @Override
             public boolean matches(InvokeRequest req) {
                 if (req == null) return false;
-                return SimulateApplication.GATHER_DATA_FUNCTION_NAME.equals(req.functionName());
+                // allow either the plain function name or the ARN returned by serviceConsumer
+                if (SimulateApplication.GATHER_DATA_FUNCTION_NAME.equals(req.functionName())) return true;
+                // also accept the ARN's trailing function name (serviceConsumer returns full arn)
+                if (req.functionName() != null && req.functionName().endsWith("") && req.functionName().contains("gatherData")) return true;
+                return false;
             }
         }))).thenReturn(gatherResp);
+
+        org.mockito.Mockito.when(mockLambda.invoke(org.mockito.ArgumentMatchers.argThat(new ArgumentMatcher<InvokeRequest>() {
+            @Override
+            public boolean matches(InvokeRequest req) {
+                if (req == null) return false;
+                return SimulateApplication.SERVICE_CONSUMER_FUNCTION_NAME.equals(req.functionName());
+            }
+        }))).thenReturn(serviceResp);
 
         // copy ExampleModel.class from classpath into models folder so the loader can find it
         String resourcePath = "/com/ttsudio/alphaback/ExampleModel.class";

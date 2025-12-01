@@ -39,6 +39,7 @@ import java.nio.file.StandardCopyOption;
 public class SimulateApplication {
     static final String GATHER_DATA_FUNCTION_NAME = "gatherData";
     static final String GET_MODEL_FUNCTION_NAME = "modelRegistryService";
+    static final String SERVICE_CONSUMER_FUNCTION_NAME = "serviceConsumer";
 
     Logger logger = LoggerFactory.getLogger(getClass());
     LambdaClient lambdaClient = LambdaClient.create();
@@ -99,6 +100,35 @@ public class SimulateApplication {
 
     private TimeSeriesData fetchTimeSeries(String timeStep, List<String> requestedStocks) {
         try {
+            // discover active gather-data function via service consumer
+            String serviceArn = null;
+            try {
+                InvokeResponse svcResp = lambdaClient.invoke(
+                        InvokeRequest.builder().functionName(SERVICE_CONSUMER_FUNCTION_NAME)
+                                .payload(SdkBytes.fromUtf8String("{}"))
+                                .build());
+                String svcPayload = svcResp.payload().asUtf8String();
+                JsonNode svcRoot = mapper.readTree(svcPayload);
+                JsonNode serviceNode = svcRoot.has("service") ? svcRoot.get("service") : svcRoot;
+                if (serviceNode != null) {
+                    if (serviceNode.has("service_arn")) serviceArn = serviceNode.get("service_arn").asText();
+                    else if (serviceNode.has("serviceArn")) serviceArn = serviceNode.get("serviceArn").asText();
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to lookup gather-data service via serviceConsumer; falling back to default", e);
+            }
+
+            // normalize ARN to a callable function name: if ARN contains ":function:", use the trailing part
+            String gatherFunctionToCall = GATHER_DATA_FUNCTION_NAME;
+            if (serviceArn != null && !serviceArn.isEmpty()) {
+                int idx = serviceArn.lastIndexOf(":function:");
+                if (idx >= 0 && idx + 10 < serviceArn.length()) {
+                    gatherFunctionToCall = serviceArn.substring(idx + 10);
+                } else {
+                    // if it's a bare name or other ARN form, just use it directly
+                    gatherFunctionToCall = serviceArn;
+                }
+            }
             // build payload using requestedStocks if provided (comma-separated string)
             com.fasterxml.jackson.databind.node.ObjectNode payloadNode = mapper.createObjectNode();
             payloadNode.put("function", timeStep);
@@ -109,11 +139,11 @@ public class SimulateApplication {
             }
             String payloadStr = mapper.writeValueAsString(payloadNode);
 
-            InvokeResponse res = lambdaClient.invoke(
+                InvokeResponse res = lambdaClient.invoke(
                     InvokeRequest.builder()
-                            .functionName(GATHER_DATA_FUNCTION_NAME)
-                            .payload(SdkBytes.fromUtf8String(payloadStr))
-                            .build());
+                        .functionName(gatherFunctionToCall)
+                        .payload(SdkBytes.fromUtf8String(payloadStr))
+                        .build());
             String payload = res.payload().asUtf8String();
             logger.info("Lambda response: " + payload);
 
