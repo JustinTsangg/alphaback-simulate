@@ -226,7 +226,7 @@ public class SimulateApplication {
             Map<String, JsonNode> tsMap = tsData.tsMap;
 
             SimulationResponse simResp = new SimulationResponse();
-            double startingCapital = 100000.0;
+            double startingCapital = 10000.0;
             double cash = startingCapital;
             Map<String, Float> owned = new HashMap<>();
 
